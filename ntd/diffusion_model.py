@@ -1,11 +1,8 @@
-import logging
-from typing import cast
+from typing import Literal, cast
 
 import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-
-log = logging.getLogger(__name__)
 
 
 class Diffusion(nn.Module):
@@ -15,7 +12,7 @@ class Diffusion(nn.Module):
     The model is initialized with a denoising network, a noise sampler and a way to compute Mahalanobis distances.
     Ususally, the noise sampler and the Mahalanobis distances will be based the same Gaussian Process.
 
-    The noise schedule can be either linear or quadratic.
+    The noise schedule and variance type are configured through diffusers DDPMScheduler.
     """
 
     def __init__(
@@ -24,7 +21,17 @@ class Diffusion(nn.Module):
         diffusion_time_steps,
         noise_sampler,
         mal_dist_computer,
-        schedule="linear",
+        schedule: Literal[
+            "linear", "scaled_linear", "squaredcos_cap_v2", "sigmoid"
+        ] = "linear",
+        variance_type: Literal[
+            "fixed_small",
+            "fixed_small_log",
+            "fixed_large",
+            "fixed_large_log",
+            "learned",
+            "learned_range",
+        ] = "fixed_small",
         start_beta=1e-4,
         end_beta=0.02,
     ):
@@ -36,40 +43,17 @@ class Diffusion(nn.Module):
         self.network = network
         self.noise_sampler = noise_sampler
         self.mal_dist_computer = mal_dist_computer
-        self.schedule = schedule
-        self.start_beta = start_beta
-        self.end_beta = end_beta
         self.diffusion_time_steps = diffusion_time_steps
-
-        if self.schedule == "linear":
-            _betas = torch.linspace(start_beta, end_beta, diffusion_time_steps)
-        elif self.schedule == "quad":  # also known as scaled linear
-            _betas = (
-                torch.linspace(start_beta**0.5, end_beta**0.5, diffusion_time_steps)
-                ** 2.0
-            )
-        else:
-            raise ValueError("Unknown schedule type.")
 
         self.scheduler = DDPMScheduler(
             num_train_timesteps=diffusion_time_steps,
-            trained_betas=_betas.cpu().numpy(),
-            variance_type="fixed_small",
+            beta_start=start_beta,
+            beta_end=end_beta,
+            beta_schedule=schedule,
+            variance_type=variance_type,
             prediction_type="epsilon",
             clip_sample=False,
         )
-        self.scheduler_beta = DDPMScheduler(
-            num_train_timesteps=diffusion_time_steps,
-            trained_betas=_betas.cpu().numpy(),
-            variance_type="fixed_large",
-            prediction_type="epsilon",
-            clip_sample=False,
-        )
-
-        self.register_buffer("betas", _betas)
-        self.register_buffer("alphas", 1.0 - _betas)
-        self.register_buffer("alpha_bars", torch.cumprod(1.0 - _betas, dim=0))
-        self.register_buffer("unormalized_probs", torch.ones(self.diffusion_time_steps))
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
@@ -77,13 +61,6 @@ class Diffusion(nn.Module):
         self.noise_sampler.to(*args, **kwargs)
         self.mal_dist_computer.to(*args, **kwargs)
         return self
-
-    def _get_scheduler(self, noise_type):
-        if noise_type == "alpha_beta":
-            return self.scheduler
-        if noise_type == "beta":
-            return self.scheduler_beta
-        raise ValueError(f"Unknown noise_type {noise_type!r}")
 
     def train_batch(self, batch, cond=None, mask=None):
         self.train()
@@ -115,7 +92,6 @@ class Diffusion(nn.Module):
         cond=None,
         sample_length=None,
         sampler=None,
-        noise_type="alpha_beta",
     ):
         if sampler is None:
             sampler = self.noise_sampler
@@ -130,8 +106,7 @@ class Diffusion(nn.Module):
                 cond = cond.repeat(num_samples, 1, 1)
 
         self.eval()
-        ddpm_scheduler = self._get_scheduler(noise_type)
-        ddpm_scheduler.set_timesteps(self.diffusion_time_steps, device=self.device)
+        self.scheduler.set_timesteps(self.diffusion_time_steps, device=self.device)
         with torch.no_grad():
             state = sampler.sample(
                 sample_shape=(
@@ -141,7 +116,7 @@ class Diffusion(nn.Module):
                 )
             )
 
-            for timestep in ddpm_scheduler.timesteps:
+            for timestep in self.scheduler.timesteps:
                 time_value = int(timestep.item())
                 time_vector = torch.full(
                     (num_samples,), time_value, device=self.device, dtype=torch.long
@@ -152,7 +127,7 @@ class Diffusion(nn.Module):
                     time_vector,
                     cond=cond,
                 )
-                state = ddpm_scheduler.step(
+                state = self.scheduler.step(
                     model_output=predicted_noise,
                     timestep=time_value,
                     sample=state,
@@ -162,7 +137,7 @@ class Diffusion(nn.Module):
             return state
 
     # Mask: 1 -> sample is present, 0 sample is not present
-    def impute(self, signal, mask, cond=None, noise_type="alpha_beta"):
+    def impute(self, signal, mask, cond=None):
         signal_batch, signal_channel, signal_length = signal.shape
         assert signal_channel == self.network.signal_channel
         assert signal.shape == mask.shape
@@ -174,8 +149,7 @@ class Diffusion(nn.Module):
             assert signal_length == cond_length
 
         self.eval()
-        ddpm_scheduler = self._get_scheduler(noise_type)
-        ddpm_scheduler.set_timesteps(self.diffusion_time_steps, device=self.device)
+        self.scheduler.set_timesteps(self.diffusion_time_steps, device=self.device)
         with torch.no_grad():
             state = self.noise_sampler.sample(
                 sample_shape=(
@@ -184,7 +158,7 @@ class Diffusion(nn.Module):
                     self.network.signal_length,
                 )
             )
-            for timestep in ddpm_scheduler.timesteps:
+            for timestep in self.scheduler.timesteps:
                 time_value = int(timestep.item())
                 time_vector = torch.full(
                     (signal_batch,), time_value, device=self.device, dtype=torch.long
@@ -201,7 +175,7 @@ class Diffusion(nn.Module):
                     (signal_batch,), time_value, device=signal.device, dtype=torch.long
                 )
                 scheduler_timesteps = cast(torch.IntTensor, timestep_vector)
-                known_state = ddpm_scheduler.add_noise(
+                known_state = self.scheduler.add_noise(
                     signal, known_noise, scheduler_timesteps
                 )
                 state = mask * known_state + (1.0 - mask) * state
@@ -211,7 +185,7 @@ class Diffusion(nn.Module):
                     time_vector,
                     cond=cond,
                 )
-                state = ddpm_scheduler.step(
+                state = self.scheduler.step(
                     model_output=predicted_noise,
                     timestep=time_value,
                     sample=state,
