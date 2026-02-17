@@ -19,8 +19,8 @@ class Diffusion(nn.Module):
         self,
         network: nn.Module,
         diffusion_time_steps: int,
-        noise_sampler: Any,
-        mal_dist_computer: Any,
+        noise_sampler: Any,  # TODO
+        mal_dist_computer: Any,  # TODO
         schedule: Literal[
             "linear", "scaled_linear", "squaredcos_cap_v2", "sigmoid"
         ] = "linear",
@@ -29,8 +29,8 @@ class Diffusion(nn.Module):
             "fixed_small_log",
             "fixed_large",
             "fixed_large_log",
-            "learned",
-            "learned_range",
+            "learned",  # TODO remove, will not be supported by tailored DDPM scheduler
+            "learned_range",  # TODO see above
         ] = "fixed_small",
         start_beta: float = 1e-4,
         end_beta: float = 0.02,
@@ -106,9 +106,7 @@ class Diffusion(nn.Module):
         num_samples: int,
         cond: torch.Tensor | None = None,
         sample_length: int | None = None,
-        sampler: Any | None = None,
     ) -> torch.Tensor:
-        active_sampler = self.noise_sampler if sampler is None else sampler
         if sample_length is None:
             sample_length = self.noise_sampler.signal_length
 
@@ -125,7 +123,7 @@ class Diffusion(nn.Module):
         was_training = self.training
         self.eval()
         with torch.no_grad():
-            state = active_sampler.sample(
+            state = self.noise_sampler.sample(
                 sample_shape=(
                     num_samples,
                     self.network.signal_channel,
