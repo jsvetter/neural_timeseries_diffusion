@@ -1,4 +1,4 @@
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import torch
 import torch.nn as nn
@@ -17,10 +17,10 @@ class Diffusion(nn.Module):
 
     def __init__(
         self,
-        network,
-        diffusion_time_steps,
-        noise_sampler,
-        mal_dist_computer,
+        network: nn.Module,
+        diffusion_time_steps: int,
+        noise_sampler: Any,
+        mal_dist_computer: Any,
         schedule: Literal[
             "linear", "scaled_linear", "squaredcos_cap_v2", "sigmoid"
         ] = "linear",
@@ -32,14 +32,19 @@ class Diffusion(nn.Module):
             "learned",
             "learned_range",
         ] = "fixed_small",
-        start_beta=1e-4,
-        end_beta=0.02,
-    ):
+        start_beta: float = 1e-4,
+        end_beta: float = 0.02,
+    ) -> None:
         super().__init__()
-        assert network.signal_length == noise_sampler.signal_length
-        assert network.signal_length == mal_dist_computer.signal_length
+        if network.signal_length != noise_sampler.signal_length:
+            raise ValueError(
+                "network.signal_length must match noise_sampler.signal_length"
+            )
+        if network.signal_length != mal_dist_computer.signal_length:
+            raise ValueError(
+                "network.signal_length must match mal_dist_computer.signal_length"
+            )
 
-        self.device = "cpu"  # default
         self.network = network
         self.noise_sampler = noise_sampler
         self.mal_dist_computer = mal_dist_computer
@@ -55,21 +60,27 @@ class Diffusion(nn.Module):
             clip_sample=False,
         )
 
-    def to(self, *args, **kwargs):
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    def to(self, *args, **kwargs) -> "Diffusion":
         super().to(*args, **kwargs)
-        self.device = next(self.parameters()).device
         self.noise_sampler.to(*args, **kwargs)
         self.mal_dist_computer.to(*args, **kwargs)
         return self
 
-    def train_batch(self, batch, cond=None, mask=None):
-        self.train()
+    def train_batch(
+        self,
+        batch: torch.Tensor,
+        cond: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch_size = batch.shape[0]
         time_index = torch.randint(
             0, self.diffusion_time_steps, (batch_size,), device=batch.device
         )
         time_index = time_index.to(batch.device, dtype=torch.long)
-        scheduler_timesteps = cast(torch.IntTensor, time_index)
         noise = self.noise_sampler.sample(
             sample_shape=(
                 batch_size,
@@ -77,38 +88,44 @@ class Diffusion(nn.Module):
                 self.network.signal_length,
             )
         )
-        assert noise.shape == batch.shape
+        if noise.shape != batch.shape:
+            raise ValueError(
+                f"noise shape {noise.shape} must match batch shape {batch.shape}"
+            )
+        scheduler_timesteps = cast(torch.IntTensor, time_index)
         noisy_sig = self.scheduler.add_noise(batch, noise, scheduler_timesteps)
-        res = self.network.forward(noisy_sig, time_index, cond=cond)
+        res = self.network(noisy_sig, time_index, cond=cond)
         diff = noise - res
-        malhabonis = self.mal_dist_computer.sqrt_mal(diff)
+        mahalanobis = self.mal_dist_computer.sqrt_mal(diff)
         if mask is not None:
-            malhabonis = malhabonis * mask
-        return torch.einsum("icl,icl->i", malhabonis, malhabonis)
+            mahalanobis = mahalanobis * mask
+        return torch.einsum("icl,icl->i", mahalanobis, mahalanobis)
 
     def sample(
         self,
-        num_samples,
-        cond=None,
-        sample_length=None,
-        sampler=None,
-    ):
-        if sampler is None:
-            sampler = self.noise_sampler
+        num_samples: int,
+        cond: torch.Tensor | None = None,
+        sample_length: int | None = None,
+        sampler: Any | None = None,
+    ) -> torch.Tensor:
+        active_sampler = self.noise_sampler if sampler is None else sampler
         if sample_length is None:
             sample_length = self.noise_sampler.signal_length
 
         if cond is not None:
-            cond_batch, cond_channel, cond_length = cond.shape
-            assert cond_batch == 1 or cond_batch == num_samples
-            assert cond_length == sample_length
+            cond_batch, _cond_channel, cond_length = cond.shape
+            if cond_batch != 1 and cond_batch != num_samples:
+                raise ValueError("cond batch size must be 1 or num_samples")
+            if cond_length != sample_length:
+                raise ValueError("cond length must match sample_length")
             if cond_batch == 1:
                 cond = cond.repeat(num_samples, 1, 1)
 
-        self.eval()
         self.scheduler.set_timesteps(self.diffusion_time_steps, device=self.device)
+        was_training = self.training
+        self.eval()
         with torch.no_grad():
-            state = sampler.sample(
+            state = active_sampler.sample(
                 sample_shape=(
                     num_samples,
                     self.network.signal_channel,
@@ -122,7 +139,7 @@ class Diffusion(nn.Module):
                     (num_samples,), time_value, device=self.device, dtype=torch.long
                 )
 
-                predicted_noise = self.network.forward(
+                predicted_noise = self.network(
                     state,
                     time_vector,
                     cond=cond,
@@ -134,28 +151,39 @@ class Diffusion(nn.Module):
                     return_dict=False,
                 )[0]
 
-            return state
+        self.train(was_training)
+        return state
 
     # Mask: 1 -> sample is present, 0 sample is not present
-    def impute(self, signal, mask, cond=None):
+    def impute(
+        self,
+        signal: torch.Tensor,
+        mask: torch.Tensor,
+        cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         signal_batch, signal_channel, signal_length = signal.shape
-        assert signal_channel == self.network.signal_channel
-        assert signal.shape == mask.shape
+        if signal_channel != self.network.signal_channel:
+            raise ValueError("signal channel must match network.signal_channel")
+        if signal.shape != mask.shape:
+            raise ValueError("signal shape must match mask shape")
         mask = mask.to(device=signal.device, dtype=signal.dtype)
 
         if cond is not None:
             cond_batch, _cond_channel, cond_length = cond.shape
-            assert cond_batch == signal_batch
-            assert signal_length == cond_length
+            if cond_batch != signal_batch:
+                raise ValueError("cond batch size must match signal batch size")
+            if signal_length != cond_length:
+                raise ValueError("cond length must match signal length")
 
-        self.eval()
         self.scheduler.set_timesteps(self.diffusion_time_steps, device=self.device)
+        was_training = self.training
+        self.eval()
         with torch.no_grad():
             state = self.noise_sampler.sample(
                 sample_shape=(
                     signal_batch,
                     self.network.signal_channel,
-                    self.network.signal_length,
+                    signal_length,
                 )
             )
             for timestep in self.scheduler.timesteps:
@@ -168,7 +196,7 @@ class Diffusion(nn.Module):
                     sample_shape=(
                         signal_batch,
                         self.network.signal_channel,
-                        self.network.signal_length,
+                        signal_length,
                     )
                 )
                 timestep_vector = torch.full(
@@ -180,7 +208,7 @@ class Diffusion(nn.Module):
                 )
                 state = mask * known_state + (1.0 - mask) * state
 
-                predicted_noise = self.network.forward(
+                predicted_noise = self.network(
                     state,
                     time_vector,
                     cond=cond,
@@ -191,7 +219,8 @@ class Diffusion(nn.Module):
                     sample=state,
                     return_dict=False,
                 )[0]
-            return state
+        self.train(was_training)
+        return state
 
 
 class Trainer:
@@ -201,28 +230,25 @@ class Trainer:
     Given a data loader and optimizer, it trains the model for one epoch.
     """
 
-    def __init__(self, model, data_loader, optimizer, device):
+    def __init__(self, model: Diffusion, data_loader: Any, optimizer: Any, device: str):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.data_loader = data_loader
 
-    def train_epoch(self):
+    def train_epoch(self) -> list[tuple[int, float]]:
         batchwise_losses = []
+        self.model.train()
         for batch in self.data_loader:
             sig_batch = batch["signal"]
             batch_size = sig_batch.shape[0]
             sig_batch = sig_batch.to(self.model.device)
             # If a Dataloader provides these, use them. If not, don't.
-            try:
-                cond_batch = batch["cond"]
+            cond_batch = batch.get("cond")
+            if cond_batch is not None:
                 cond_batch = cond_batch.to(self.model.device)
-            except KeyError:
-                cond_batch = None
-            try:
-                mask_batch = batch["mask"]
+            mask_batch = batch.get("mask")
+            if mask_batch is not None:
                 mask_batch = mask_batch.to(self.model.device)
-            except KeyError:
-                mask_batch = None
 
             batch_loss = self.model.train_batch(
                 sig_batch, cond=cond_batch, mask=mask_batch
